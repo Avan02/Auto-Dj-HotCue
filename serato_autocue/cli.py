@@ -7,6 +7,7 @@ from pathlib import Path
 from .id3_io import read_markers2, write_markers2
 from .phrase_cues import detect_phrase_cues
 from .serato_markers import CuePoint, Markers2Tag
+from .structure import detect_structural_cues
 
 CUE_COLORS = [
     (0xCC, 0x00, 0x00),
@@ -19,6 +20,14 @@ CUE_COLORS = [
     (0xCC, 0x00, 0x88),
 ]
 
+LABEL_COLORS = {
+    "Intro": (0x00, 0xCC, 0x00),
+    "Drop": (0xCC, 0x00, 0x00),
+    "Breakdown": (0x00, 0x88, 0xCC),
+    "Transition": (0xCC, 0xCC, 0x00),
+    "Outro": (0x88, 0x00, 0xCC),
+}
+
 
 def find_mp3s(target: Path) -> list[Path]:
     if target.is_file():
@@ -29,16 +38,31 @@ def find_mp3s(target: Path) -> list[Path]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="serato-autocue",
-        description="Detect beat-grid phrase points and write them as Serato hot cues.",
+        description="Detect hot cue points and write them into Serato MP3 tags.",
     )
     parser.add_argument("path", type=Path, help="MP3 file or a folder to scan recursively")
     parser.add_argument(
+        "--mode", choices=["structural", "phrase"], default="structural",
+        help=(
+            "structural (default): place cues at detected drops/breakdowns/transitions. "
+            "phrase: place a cue every --bars-per-phrase bars, uniformly."
+        ),
+    )
+    parser.add_argument(
         "--bars-per-phrase", type=int, default=8,
-        help="place a cue every N bars (default: 8)",
+        help="[phrase mode] place a cue every N bars (default: 8)",
     )
     parser.add_argument(
         "--beat-offset", type=int, default=0,
-        help="shift phrase alignment by this many beats if downbeats land off (default: 0)",
+        help="[phrase mode] shift phrase alignment by this many beats if downbeats land off (default: 0)",
+    )
+    parser.add_argument(
+        "--min-bars-between-cues", type=int, default=4,
+        help="[structural mode] minimum spacing between cues, in bars (default: 4)",
+    )
+    parser.add_argument(
+        "--novelty-window-bars", type=int, default=4,
+        help="[structural mode] size of the structural-change detection window, in bars (default: 4)",
     )
     parser.add_argument(
         "--max-cues", type=int, default=8,
@@ -61,6 +85,52 @@ def build_parser() -> argparse.ArgumentParser:
         help="DANGEROUS: skip making a backup copy before writing tags",
     )
     return parser
+
+
+def _phrase_cues(y, sr, args) -> list[CuePoint]:
+    plan = detect_phrase_cues(
+        y, sr,
+        bars_per_phrase=args.bars_per_phrase,
+        beat_offset=args.beat_offset,
+        max_cues=args.max_cues,
+    )
+    if not plan.cue_times_s:
+        return []
+    print(f"  bpm ~= {plan.bpm:.1f}, {len(plan.cue_times_s)} phrase cue(s):")
+    cues = []
+    for i, t in enumerate(plan.cue_times_s):
+        mins, secs = divmod(t, 60)
+        print(f"    cue {i}: {int(mins):02d}:{secs:05.2f}  Phrase {i + 1}")
+        cues.append(CuePoint(
+            index=i,
+            position_ms=int(round(t * 1000)),
+            color=CUE_COLORS[i % len(CUE_COLORS)],
+            name=f"Phrase {i + 1}",
+        ))
+    return cues
+
+
+def _structural_cues(y, sr, args) -> list[CuePoint]:
+    plan = detect_structural_cues(
+        y, sr,
+        min_bars_between_cues=args.min_bars_between_cues,
+        novelty_window_bars=args.novelty_window_bars,
+        max_cues=args.max_cues,
+    )
+    if not plan.cues:
+        return []
+    print(f"  bpm ~= {plan.bpm:.1f}, {len(plan.cues)} structural cue(s):")
+    cues = []
+    for i, c in enumerate(plan.cues):
+        mins, secs = divmod(c.time_s, 60)
+        print(f"    cue {i}: {int(mins):02d}:{secs:05.2f}  {c.label} (score {c.score:.2f})")
+        cues.append(CuePoint(
+            index=i,
+            position_ms=int(round(c.time_s * 1000)),
+            color=LABEL_COLORS.get(c.label, CUE_COLORS[i % len(CUE_COLORS)]),
+            name=c.label,
+        ))
+    return cues
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -101,28 +171,14 @@ def main(argv: list[str] | None = None) -> int:
             exit_code = 1
             continue
 
-        plan = detect_phrase_cues(
-            y, sr,
-            bars_per_phrase=args.bars_per_phrase,
-            beat_offset=args.beat_offset,
-            max_cues=args.max_cues,
-        )
+        if args.mode == "phrase":
+            cues = _phrase_cues(y, sr, args)
+        else:
+            cues = _structural_cues(y, sr, args)
 
-        if not plan.cue_times_s:
-            print("  no beats detected, skipping")
+        if not cues:
+            print("  no cues detected, skipping")
             continue
-
-        print(f"  bpm ~= {plan.bpm:.1f}, {len(plan.cue_times_s)} phrase cue(s):")
-        cues = []
-        for i, t in enumerate(plan.cue_times_s):
-            mins, secs = divmod(t, 60)
-            print(f"    cue {i}: {int(mins):02d}:{secs:05.2f}")
-            cues.append(CuePoint(
-                index=i,
-                position_ms=int(round(t * 1000)),
-                color=CUE_COLORS[i % len(CUE_COLORS)],
-                name=f"Phrase {i + 1}",
-            ))
 
         if not args.apply:
             continue
